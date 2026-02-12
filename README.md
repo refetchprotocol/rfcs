@@ -2,21 +2,23 @@
 
 ## Abstract
 
-This document defines the **Refetch Protocol**, a secure mechanism for a client to instruct a server to fetch data from a third-party source, extract specific claims, and return a cryptographically verifiable proof of the result. The protocol is designed to be **transport-agnostic**, **flexible** (supporting various data formats and extraction logic), and **type-safe** (ensuring strictly defined schemas for all interactions).
+This document defines the **Refetch Protocol**, a secure mechanism for a client to instruct a server to fetch data from a third-party source, extract specific claims, and return a cryptographically verifiable proof of the result. Crucially, it provides a guarantee that the requested data is **tamper-proof** and **originates correctly from the source**, with fields that can be independently verified. The protocol is designed to be **transport-agnostic**, **flexible** (supporting various data formats and extraction logic), and **type-safe** (ensuring strictly defined schemas for all interactions).
 
 ## 1. Protocol Overview
 
 The protocol follows a "Sealed Instructions" model:
 1.  **Client** constructs a `RefetchRequest` containing execution instructions, extraction logic, and cryptographic parameters.
 2.  **Client** encrypts and signs this request into a **JWE (JSON Web Encryption)** container.
-3.  **Server** receives the JWE, decrypts it, validates the signature, and executes the instructions.
-4.  **Server** fetches the target resource, runs the extraction logic, and computes proofs.
-5.  **Server** constructs a `RefetchResponse`, signs/encrypts it into a new JWE, and returns it to the client.
+3.  **Verifier** receives (or observes) the JWE, decrypts it, validates the signature, and executes the instructions.
+4.  **Verifier** performs the verification (e.g. fetches the target resource or verifies a ZK proof), runs the extraction logic, and computes proofs.
+5.  **Verifier** constructs a `RefetchResponse`, signs/encrypts it into a new JWE, and returns it to the client.
+
+*Note: The **Verifier** is the entity responsible for attesting to the response. Depending on the `verificationMode`, this could be a Relay Server, a Notary in a ZK-TLS session, or a Trusted Execution Environment (TEE), etc.*
 
 ### 1.1 Goals
 
 *   **Security**: End-to-end secrecy and integrity of instructions and results.
-*   **Flexibility**: Support for HTTP/HTTPS, various methods (GET, POST), and complex extraction (Regex, JSONPath, CSS).
+*   **Flexibility**: Support for HTTP/HTTPS, various methods (GET, POST), and complex extraction (Regex, JSONPath, XPath, Byte Range).
 *   **Type Safety**: All payloads and selectors are strictly typed to minimize runtime errors and ambiguity.
 *   **Verifiability**: The response contains a cryptographic proof that can be independently verified.
 
@@ -53,6 +55,14 @@ type RefetchRequest = {
    * Configuration for the execution environment.
    */
   options?: RequestOptions;
+
+  /**
+   * Specifies how the verification should be performed and by whom.
+   * Dictionary of supported modes is extensible. 
+   * - `relay`: A generic Verifier (Server) makes the request on behalf of the client (Default).
+   * - (Future modes can include `zk-tls`, `tee`, etc. where Client makes request and Verifier observes).
+   */
+  verificationMode?: "relay" | string;
 };
 
 type ParameterValue = {
@@ -108,7 +118,7 @@ type Extraction = {
 type Selector = 
   | { type: "regex"; pattern: string; group?: number }
   | { type: "jsonpath"; query: string }
-  | { type: "range"; start: number; end?: number } // Byte/Character range. End is optional (to overwrite until end)
+  | { type: "range"; start: number; end?: number } // Byte range. End is optional (to overwrite until end)
   | { type: "xpath"; query: string };
 
 type Assertion = {
