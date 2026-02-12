@@ -63,6 +63,27 @@ type RefetchRequest = {
    * - (Future modes can include `zk-tls`, `tee`, etc. where Client makes request and Verifier observes).
    */
   verificationMode?: "relay" | string;
+
+  /** Issuer of the request (e.g., "client_app_1") */
+  iss: string;
+
+  /** Issued At Timestamp (seconds) */
+  iat: number;
+
+  /** Expiration Timestamp (seconds) */
+  exp: number;
+
+  /** This will be verifier who is the issuer of the response (e.g., "refetch-verifier") */
+  aud: string;
+
+  /** The identifier of the user (e.g., "user_123") */
+  sub: string;
+
+  /**
+   * Additional metadata (e.g., payment tokens, trace context, L402).
+   * Free-form dictionary.
+   */
+  metadata?: Record<string, string>;
 };
 
 type ParameterValue = {
@@ -144,9 +165,24 @@ The decrypted payload of the response JWE.
 ```typescript
 type RefetchResponse = {
   requestId: string;
+
+  /** Issuer of the response (e.g., "refetch-verifier") */
+  iss: string;
+
+  /** Issued At Timestamp (seconds) */
+  iat: number;
+
+  /** Expiration Timestamp (seconds) */
+  exp: number;
+
+  /** The issuer of the original request (Client's 'iss') */
+  aud: string;
+
+  /** The identifier of the user (e.g., "user_123") */
+  sub: string;
   
   /** Status of the overall execution */
-  status: "success" | "partial_error" | "failed";
+  status: "success" | "partial_error" | "failed" | "declined";
   
   /** 
    * The original request information (sanitized/redacted).
@@ -166,8 +202,13 @@ type RefetchResponse = {
   
   /** Cryptographic proof of the execution */
   integrity: {
-    hash: string; // Hash of the raw response body
+    hash: string; // Hash of the raw response body (SHA-256)
     timestamp: number;
+    /** 
+     * Optional Signature if distinct from the JWE signature.
+     * e.g., a Reclaim Protocol proof object.
+     */
+    proof?: unknown; 
   };
 };
 
@@ -188,10 +229,18 @@ type ExtractionResult = {
 };
 
 type ExecutionError = {
-  code: string;
+  code: ErrorCode;
   message: string;
   field?: string; // If related to a specific extraction
 };
+
+type ErrorCode = 
+  | "UNAUTHORIZED" 
+  | "PAYMENT_REQUIRED" 
+  | "NETWORK_ERROR" 
+  | "SELECTOR_MISMATCH" 
+  | "ASSERTION_FAILED" 
+  | "INTERNAL_ERROR";
 ```
 
 ---
@@ -205,7 +254,8 @@ The protocol relies on standard JOSE (Javascript Object Signing and Encryption) 
 *   **Header**:
     *   `alg`: `ECDH-ES` (or similar standard key agreement)
     *   `enc`: `A256GCM` (AES GCM for authenticated encryption)
-    *   `kid`: ID of the server's public key utilized for encryption.
+    *   `kid`: ID of the Verifier's public key utilized for encryption.
+    *   `jku`: (Optional) URI to the sender's JWK Set for signature verification (if signed).
     *   `cty`: `application/refetch-request+json`
 *   **Payload**: JSON serialization of `RefetchRequest`.
 
@@ -214,7 +264,8 @@ The protocol relies on standard JOSE (Javascript Object Signing and Encryption) 
 *   **Header**:
     *   `alg`: `ECDH-ES`
     *   `enc`: `A256GCM`
-    *   `kid`: ID of the server's signing key.
+    *   `kid`: ID of the Client's public key (for encryption).
+    *   `jku`: URI to the Verifier's JWK Set (for signature verification).
 *   **Payload**: JSON serialization of `RefetchResponse`.
 
 ### 3.3 Replay Protection
@@ -254,6 +305,11 @@ Resolves to: `https://api.example.com/data/123`
 ```json
 {
   "requestId": "req_unique_001",
+  "iss": "client_app_abc",
+  "iat": 1715000000,
+  "exp": 1715000060,
+  "aud": "refetch-verifier-node-1",
+  "sub": "user_123",
   "target": {
     "url": "https://api.social.com/me",
     "method": "GET",
@@ -322,7 +378,12 @@ This is the payload inside the response JWE:
 ```json
 {
   "requestId": "req_unique_001",
+  "iss": "refetch-verifier-node-1",
+  "iat": 1715000100,
+  "exp": 1715003700,
+  "aud": "client_app_abc",
   "status": "success",
+  "sub": "user_555",
   "requestTrace": {
     "targetUrl": "https://api.social.com/me",
     "method": "GET"
@@ -353,4 +414,74 @@ This is the payload inside the response JWE:
 
 ---
 
-## 6. Future Extensions
+### 5.4 Example of Error Response
+
+If the expectation fails (e.g. assertion error), the response might look like this:
+
+```json
+{
+  "requestId": "req_unique_001",
+  "iss": "refetch-verifier-node-1",
+  "iat": 1715000100,
+  "exp": 1715003700,
+  "aud": "client_app_abc",
+  "sub": "user_555",
+  "status": "failed",
+  "requestTrace": {
+    "targetUrl": "https://api.social.com/me",
+    "method": "GET"
+  },
+  "results": {
+    "user_id": {
+      "value": "user_555",
+      "verified": false,
+      "redaction_mode": "none"
+    },
+    "account_type": {
+      "value": "basic", // Actual value found
+      "verified": false, // Assertion failed (expected "premium")
+      "redaction_mode": "none"
+    }
+  },
+  "errors": [
+    {
+      "code": "ASSERTION_FAILED",
+      "message": "Expected 'premium' but found 'basic'",
+      "field": "account_type"
+    }
+  ],
+  "integrity": {
+    "hash": "sha256:...",
+    "timestamp": 1715000100
+  }
+}
+```
+
+---
+
+## 6. Policies & Strategies
+
+This protocol is a general-purpose specification. The specific policies for acceptance and verification strategy are left to the implementation of the Client and Verifier.
+
+### 6.1 Verifier Policies
+
+A Verifier MAY reject a request for various reasons, including but not limited to:
+*   **Authentication Failure**: The request signature cannot be verified or the `iss` is unknown.
+*   **Authorization**: The `iss` is not on a whitelist, or the requested `target.url` is blacklisted.
+*   **Capabilities**: The requested `verificationMode` is not supported.
+*   **Commercial**: Lack of payment or quota coverage.
+*   **Operational**: Rate limiting or IP restrictions.
+
+If rejected, the Verifier SHOULD return a JWE with a `status: "declined"` or `status: "failed"` and an appropriate error code (e.g., `UNAUTHORIZED`, `PAYMENT_REQUIRED`).
+
+### 6.2 Example of Client Verification Strategies
+
+The Client is responsible for selecting which Verifier(s) to trust. Strategies include:
+*   **Single Trusted Verifier**: Utilizing a specific server-side verifier known to be reliable.
+*   **Multi-Verifier (Consensus)**: Sending the same request to multiple distinct Verifiers (e.g., distinct nodes, different regions) and accepting the result only if a quorum matches.
+*   **Local/Internal Verifier**: Using a verifier running on localhost or an internal network for privacy or latency reasons.
+*   **Slashing/Banning**: A Client MAY maintain a reputation score for Verifiers and ban (slash) those that return incorrect results, invalid proofs, or fail to respond.
+
+---
+
+## 7. Future Extensions
